@@ -1,19 +1,10 @@
 import { EventEmitter } from 'events';
 import { IncomingMessage } from 'http';
 import { NodeOption, Shoukaku } from '../Shoukaku';
-import { Player } from '../guild/Player';
-import { OPCodes, State, Versions } from '../Constants';
+import { OpCodes, State, Versions } from '../Constants';
 import { wait } from '../Utils';
 import { Rest } from './Rest';
 import Websocket from 'ws';
-
-export interface VoiceChannelOptions {
-    guildId: string;
-    shardId: number;
-    channelId: string;
-    deaf?: boolean;
-    mute?: boolean;
-}
 
 export interface NodeStats {
     players: number;
@@ -37,22 +28,47 @@ export interface NodeStats {
     uptime: number;
 }
 
+type NodeInfoVersion = {
+    semver: string;
+    major: number;
+    minor: number;
+    patch: number;
+    preRelease?: string;
+    build?: string;
+};
+
+type NodeInfoGit = {
+    branch: string;
+    commit: string;
+    commitTime: number;
+};
+
+type NodeInfoPlugin = {
+    name: string;
+    version: string;
+};
+
+export type NodeInfo = {
+    version: NodeInfoVersion;
+    buildTime: number;
+    git: NodeInfoGit;
+    jvm: string;
+    lavaplayer: string;
+    sourceManagers: string[];
+    filters: string[];
+    plugins: NodeInfoPlugin[];
+};
+
 export interface ResumableHeaders {
     [key: string]: string;
     'Client-Name': string;
     'User-Agent': string;
     'Authorization': string;
     'User-Id': string;
-    'Resume-Key': string;
+    'Session-Id': string;
 }
 
-export interface NonResumableHeaders {
-    [key: string]: string;
-    'Client-Name': string;
-    'User-Agent': string;
-    'Authorization': string;
-    'User-Id': string;
-}
+export interface NonResumableHeaders extends Omit<ResumableHeaders, 'Session-Id'> {}
 
 /**
  * Represents a Lavalink node
@@ -62,10 +78,6 @@ export class Node extends EventEmitter {
      * Shoukaku class
      */
     public readonly manager: Shoukaku;
-    /**
-     * A map of guild ID to players
-     */
-    public readonly players: Map<string, Player>;
     /**
      * Lavalink rest API
      */
@@ -103,6 +115,10 @@ export class Node extends EventEmitter {
      */
     public stats: NodeStats|null;
     /**
+     * Information about lavalink node
+    */
+    public info: NodeInfo|null;
+    /**
      * Websocket instance
      */
     public ws: Websocket|null;
@@ -111,7 +127,7 @@ export class Node extends EventEmitter {
      */
     public sessionId: string|null;
     /**
-     * Boolean that represents if the node has initialized once (will always be true when alwaysSendResumeKey is true)
+     * Boolean that represents if the node has initialized once
      */
     protected initialized: boolean;
     /**
@@ -120,6 +136,7 @@ export class Node extends EventEmitter {
     protected destroyed: boolean;
     /**
      * @param manager Shoukaku instance
+     * @param options Options on creating this node
      * @param options.name Name of this node
      * @param options.url URL of Lavalink
      * @param options.auth Credentials to access Lavalnk
@@ -129,7 +146,6 @@ export class Node extends EventEmitter {
     constructor(manager: Shoukaku, options: NodeOption) {
         super();
         this.manager = manager;
-        this.players = new Map();
         this.rest = new (this.manager.options.structures.rest || Rest)(this, options);
         this.name = options.name;
         this.group = options.group;
@@ -139,9 +155,10 @@ export class Node extends EventEmitter {
         this.reconnects = 0;
         this.state = State.DISCONNECTED;
         this.stats = null;
+        this.info = null;
         this.ws = null;
         this.sessionId = null;
-        this.initialized = this.manager.options.alwaysSendResumeKey ?? false;
+        this.initialized = false;
         this.destroyed = false;
     }
 
@@ -180,38 +197,25 @@ export class Node extends EventEmitter {
         if (!this.manager.id) throw new Error('Don\'t connect a node when the library is not yet ready');
         if (this.destroyed) throw new Error('You can\'t re-use the same instance of a node once disconnected, please re-add the node again');
 
-        const resume = this.initialized && (this.manager.options.resume && this.manager.options.resumeKey);
         this.state = State.CONNECTING;
-        let headers: ResumableHeaders|NonResumableHeaders;
 
-        if (resume) {
-            headers = {
-                'Client-Name': this.manager.options.userAgent,
-                'User-Agent': this.manager.options.userAgent,
-                'Authorization': this.auth,
-                'User-Id': this.manager.id,
-                'Resume-Key': this.manager.options.resumeKey
-            };
-        } else {
-            headers = {
-                'Client-Name': this.manager.options.userAgent,
-                'User-Agent': this.manager.options.userAgent,
-                'Authorization': this.auth,
-                'User-Id': this.manager.id
-            };
-        }
+        const headers: NonResumableHeaders|ResumableHeaders = {
+            'Client-Name': this.manager.options.userAgent,
+            'User-Agent': this.manager.options.userAgent,
+            'Authorization': this.auth,
+            'User-Id': this.manager.id
+        };
 
-        this.emit('debug', `[Socket] -> [${this.name}] : Connecting ${this.url}, Version: ${this.version}, Trying to resume? ${resume}`);
-
+        if (this.sessionId) headers['Resume-Key'] = this.sessionId;
+        this.emit('debug', `[Socket] -> [${this.name}] : Connecting ${this.url}, Version: ${this.version}, Trying to resume? ${!!this.sessionId}`);
         if (!this.initialized) this.initialized = true;
 
         const url = new URL(`${this.url}${this.version}/websocket`);
-
         this.ws = new Websocket(url.toString(), { headers } as Websocket.ClientOptions);
         this.ws.once('upgrade', response => this.open(response));
         this.ws.once('close', (...args) => this.close(...args));
         this.ws.on('error', error => this.error(error));
-        this.ws.on('message', data => this.wrap('message', data));
+        this.ws.on('message', data => this.message(data).catch(error => this.error(error)));
     }
 
     /**
@@ -232,59 +236,13 @@ export class Node extends EventEmitter {
     }
 
     /**
-     * Join a voice channel in a guild
-     * @param options.guildId Guild ID in which voice channel to connect to is located
-     * @param options.shardId Shard ID in which the guild exists
-     * @param options.channelId Channel ID of voice channel to connect to
-     * @param options.deaf Optional boolean value to specify whether to deafen the current bot user
-     * @param options.mute Optional boolean value to specify whether to mute the current bot user
-     * @returns A promise that resolves to a player class
-     */
-    public async joinChannel(options: VoiceChannelOptions): Promise<Player> {
-        if (this.state !== State.CONNECTED)
-            throw new Error('This node is not yet ready');
-        let player = this.players.get(options.guildId);
-        if (player?.connection.state === State.CONNECTING)
-            throw new Error('Can\'t join this channel. This connection is connecting');
-        if (player?.connection.state === State.CONNECTED)
-            throw new Error('Can\'t join this channel. This connection is already connected');
-        if (player?.connection.reconnecting)
-            throw new Error('Can\'t join this channel. This connection is currently force-reconnecting');
-        try {
-            if (!player) {
-                if (this.manager.options.structures.player) {
-                    player = new this.manager.options.structures.player(this, options);
-                } else {
-                    player = new Player(this, options);
-                }
-                this.players.set(options.guildId, player!);
-            }
-            await player!.connection.connect(options);
-            return player!;
-        } catch (error) {
-            this.players.delete(options.guildId);
-            throw error;
-        }
-    }
-
-    /**
-     * Disconnect from connected voice channel
-     * @param guildId ID of guild that contains voice channel
-     */
-    public async leaveChannel(guildId: string): Promise<void> {
-        const player = this.players.get(guildId);
-        if (!player) return;
-        return await player.connection.disconnect();
-    }
-
-    /**
      * Handle connection open event from Lavalink
      * @param response Response from Lavalink
      * @internal
      */
     private open(response: IncomingMessage): void {
         const resumed = response.headers['session-resumed'] === 'true';
-        this.emit('debug', `[Socket] <-> [${this.name}] : Connection Handshake Done! ${this.url} | Upgrade Headers Resuned: ${resumed}`);
+        this.emit('debug', `[Socket] <-> [${this.name}] : Connection Handshake Done! ${this.url} | Upgrade Headers Resumed: ${resumed}`);
         this.reconnects = 0;
         this.state = State.NEARLY;
     }
@@ -300,17 +258,17 @@ export class Node extends EventEmitter {
         if (!json) return;
         this.emit('raw', json);
         switch(json.op) {
-            case OPCodes.STATS:
+            case OpCodes.STATS:
                 this.emit('debug', `[Socket] <- [${this.name}] : Node Status Update | Server Load: ${this.penalties}`);
                 this.stats = json;
                 break;
-            case OPCodes.READY:
+            case OpCodes.READY:
                 this.sessionId = json.sessionId;
-
-                const resumeByLibrary = this.initialized && (this.players.size && this.manager.options.resumeByLibrary);
+                const players = [ ...this.manager.players.values() ].filter(player => player.node.name === this.name);
+                const resumeByLibrary = this.initialized && (players.length && this.manager.options.resumeByLibrary);
                 if (!json.resumed && resumeByLibrary) {
                     try {
-                        await this.resumeInternally();
+                        await this.resumePlayers();
                     } catch (error) {
                         this.error(error);
                     }
@@ -320,16 +278,16 @@ export class Node extends EventEmitter {
                 this.emit('debug', `[Socket] -> [${this.name}] : Lavalink is ready! | Lavalink resume: ${json.resumed} | Lib resume: ${!!resumeByLibrary}`);
                 this.emit('ready', json.resumed || resumeByLibrary);
 
-                if (this.manager.options.resume && this.manager.options.resumeKey) {
-                    await this.rest.updateSession(this.manager.options.resumeKey, this.manager.options.resumeTimeout);
+                if (this.manager.options.resume) {
+                    await this.rest.updateSession(this.manager.options.resume, this.manager.options.resumeTimeout);
                     this.emit('debug', `[Socket] -> [${this.name}] : Resuming configured!`);
                 }
                 break;
-            case OPCodes.EVENT:
-            case OPCodes.PLAYER_UPDATE:
-                const player = this.players.get(json.guildId);
+            case OpCodes.EVENT:
+            case OpCodes.PLAYER_UPDATE:
+                const player = this.manager.players.get(json.guildId);
                 if (!player) return;
-                if (json.op === OPCodes.EVENT)
+                if (json.op === OpCodes.EVENT)
                     player.onPlayerEvent(json);
                 else
                     player.onPlayerUpdate(json);
@@ -365,7 +323,7 @@ export class Node extends EventEmitter {
      * Destroys the websocket connection
      * @internal
      */
-    private destroy(move: boolean, count: number = 0): void {
+    private destroy(count: number = 0): void {
         this.ws?.removeAllListeners();
         this.ws?.close();
         this.ws = null;
@@ -373,7 +331,7 @@ export class Node extends EventEmitter {
         this.state = State.DISCONNECTED;
         if (!this.shouldClean) return;
         this.destroyed = true;
-        this.emit('disconnect', move, count);
+        this.emit('disconnect', count);
     }
 
     /**
@@ -381,15 +339,15 @@ export class Node extends EventEmitter {
      * @internal
      */
     private async clean(): Promise<void> {
-        const move = this.manager.options.moveOnDisconnect && [ ...this.manager.nodes.values() ].filter(node => node.group === this.group).length > 1;
-        if (!move) return this.destroy(false);
-        const count = this.players.size;
+        const move = this.manager.options.moveOnDisconnect;
+        if (!move) return this.destroy();
+        let count = 0;
         try {
-            await this.movePlayers();
+            count = await this.movePlayers();
         } catch (error) {
             this.error(error);
         } finally {
-            this.destroy(move, count);
+            this.destroy(count);
         }
     }
 
@@ -399,7 +357,7 @@ export class Node extends EventEmitter {
      */
     private async reconnect(): Promise<void> {
         if (this.state === State.RECONNECTING) return;
-        if (this.state !== State.DISCONNECTED) this.destroy(false);
+        if (this.state !== State.DISCONNECTED) this.destroy();
         this.state = State.RECONNECTING;
         this.reconnects++;
         this.emit('reconnecting', this.manager.options.reconnectTries - this.reconnects, this.manager.options.reconnectInterval);
@@ -409,32 +367,24 @@ export class Node extends EventEmitter {
     }
 
     /**
-     * Wraps the compatible function with an error handling
-     * @internal
-     */
-    private wrap(name: 'message', ...args: [unknown]): void {
-        this[name].apply(this, args)
-            .catch(error => this.error(error));
-    }
-
-    /**
      * Tries to resume the players internally
      * @internal
      */
-    private async resumeInternally(): Promise<void> {
+    private async resumePlayers(): Promise<void> {
         const playersWithData = [];
         const playersWithoutData = [];
 
-        for (const player of this.players.values()) {
-            if (player.connection.hasRequiredVoiceData)
+        for (const player of this.manager.players.values()) {
+            const serverUpdate = this.manager.connections.get(player.guildId)?.serverUpdate;
+            if (serverUpdate)
                 playersWithData.push(player);
             else
                 playersWithoutData.push(player);
         }
 
-        await Promise.all([
+        await Promise.allSettled([
             ...playersWithData.map(player => player.resume()),
-            ...playersWithoutData.map(player => player.connection.disconnect(false))
+            ...playersWithoutData.map(player => this.manager.leaveVoiceChannel(player.guildId))
         ]);
     }
 
@@ -442,26 +392,9 @@ export class Node extends EventEmitter {
      * Tries to move the players to another node
      * @internal
      */
-    private async movePlayers(): Promise<void> {
-        const players = [ ...this.players.values() ];
-        await Promise.all(players.map(player => player.moveToRecommendedNode()));
-    }
-
-    /**
-     * Handle raw message from Discord
-     * @param packet Packet data
-     * @internal
-     */
-    public discordRaw(packet: any): void {
-        const player = this.players.get(packet.d.guild_id);
-        if (!player) return;
-
-        if (packet.t === 'VOICE_SERVER_UPDATE') {
-            player.connection.setServerUpdate(packet.d);
-            return;
-        }
-
-        if (packet.d.user_id !== this.manager.id) return;
-        player.connection.setStateUpdate(packet.d);
+    private async movePlayers(): Promise<number> {
+        const players = [ ...this.manager.players.values() ];
+        const data = await Promise.allSettled(players.map(player => player.move()));
+        return data.filter(results => results.status === 'fulfilled').length;
     }
 }

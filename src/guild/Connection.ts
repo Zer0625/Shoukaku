@@ -1,8 +1,6 @@
 import { EventEmitter, once } from 'events';
-import { OPCodes, State, VoiceState } from '../Constants';
-import { VoiceChannelOptions } from '../node/Node';
-import { LavalinkPlayerVoiceOptions } from '../node/Rest';
-import { Player } from './Player';
+import { State, VoiceState } from '../Constants';
+import { Shoukaku, VoiceChannelOptions } from '../Shoukaku.js';
 
 /**
  * Represents the partial payload from a stateUpdate event
@@ -28,29 +26,22 @@ export interface ServerUpdate {
  */
 export class Connection extends EventEmitter {
     /**
-     * An instance of the Player class
+     * The manager where this connection is on
      */
-    public readonly player: Player;
+    public manager: Shoukaku;
     /**
-     * ID of Guild that contains the connected voice channel
+     * GuildId of the connection that is being managed by this instance
      */
     public guildId: string;
     /**
-     * ID of the connected voice channel
+     * VoiceChannelId of the connection that is being managed by this instance
      */
     public channelId: string|null;
+
     /**
-     * ID of the Shard that contains the guild that contains the connected voice channel
+     * ShardId where this connection sends data on
      */
     public shardId: number;
-    /**
-     * ID of current session
-     */
-    public sessionId: string|null;
-    /**
-     * Region of connected voice channel
-     */
-    public region: string|null;
     /**
      * Mute status in connected voice channel
      */
@@ -60,56 +51,52 @@ export class Connection extends EventEmitter {
      */
     public deafened: boolean;
     /**
+     * Id of the voice channel where this instance was connected before the current channelId
+     */
+    public lastChannelId: string|null;
+    /**
+     * Id of the currently active voice channel connection
+     */
+    public sessionId: string|null;
+    /**
+     * Region of connected voice channel
+     */
+    public region: string|null;
+    /**
+     * Last region of the connected voice channel
+     */
+    public lastRegion: string|null;
+    /**
+     * Cached serverUpdate event from Lavalink
+     */
+    public serverUpdate: ServerUpdate|null;
+    /**
      * Connection state
      */
     public state: State;
     /**
-     * Boolean that indicates if voice channel changed since initial connection
-     */
-    public moved: boolean;
-    /**
-     * Boolean that indicates if this instance is reconnecting
-     */
-    public reconnecting: boolean;
-    /**
-     * Cached serverUpdate event from Lavalink
-     */
-    private serverUpdate: ServerUpdate|null;
-    /**
-     * @param player Shoukaku Player class
-     * @param options.guildId Guild ID in which voice channel to connect to is located
-     * @param options.shardId Shard ID in which the guild exists
-     * @param options.channelId Channel ID of voice channel to connect to
+     * @param manager The manager of this connection
+     * @param options The options to pass in connection creation
+     * @param options.guildId GuildId in which voice channel to connect to is located
+     * @param options.shardId ShardId in which the guild exists
+     * @param options.channelId ChannelId of voice channel to connect to
      * @param options.deaf Optional boolean value to specify whether to deafen the current bot user
      * @param options.mute Optional boolean value to specify whether to mute the current bot user
      */
-    constructor(player: Player, options: VoiceChannelOptions) {
+    constructor(manager: Shoukaku, options: VoiceChannelOptions) {
         super();
-        this.player = player;
+        this.manager = manager;
         this.guildId = options.guildId;
-        this.channelId = null;
+        this.channelId = options.channelId;
         this.shardId = options.shardId;
+        this.muted = options.mute ?? false;
+        this.deafened = options.deaf ?? false;
+        this.lastChannelId = null;
         this.sessionId = null;
         this.region = null;
-        this.muted = false;
-        this.deafened = false;
-        this.state = State.DISCONNECTED;
-        this.moved = false;
-        this.reconnecting = false;
+        this.lastRegion = null;
         this.serverUpdate = null;
-    }
-
-    public get serverUpdateInfo(): LavalinkPlayerVoiceOptions {
-        if (!this.hasRequiredVoiceData) throw new Error('No server update / session id present');
-        return {
-            token: this.serverUpdate!.token,
-            endpoint: this.serverUpdate!.endpoint,
-            sessionId: this.sessionId!
-        };
-    }
-
-    public get hasRequiredVoiceData(): boolean {
-        return !!this.serverUpdate;
+        this.state = State.DISCONNECTED;
     }
 
     /**
@@ -119,7 +106,7 @@ export class Connection extends EventEmitter {
      */
     public setDeaf(deaf = false): void {
         this.deafened = deaf;
-        this.send({ guild_id: this.guildId, channel_id: this.channelId, self_deaf: this.deafened, self_mute: this.muted });
+        this.sendVoiceUpdate();
     }
 
     /**
@@ -129,60 +116,51 @@ export class Connection extends EventEmitter {
      */
     public setMute(mute = false): void {
         this.muted = mute;
-        this.send({ guild_id: this.guildId, channel_id: this.channelId, self_deaf: this.deafened, self_mute: this.muted });
+        this.sendVoiceUpdate();
     }
 
     /**
      * Disconnect the current bot user from the connected voice channel
-     * @param destroyRemotePlayer If you want to destroy the remote player automatically when this is called or not
+     * @internal
      */
-    public async disconnect(destroyRemotePlayer: boolean = true): Promise<void> {
-        if (this.state !== State.DISCONNECTED) {
-            this.state = State.DISCONNECTING;
-            this.send({ guild_id: this.guildId, channel_id: null, self_mute: false, self_deaf: false });
-        }
-        this.player.node.players.delete(this.guildId);
-        this.player.clean();
+    public disconnect(): void {
+        if (this.state === State.DISCONNECTED) return;
+        this.channelId = null;
+        this.deafened = false;
+        this.muted = false;
+        this.removeAllListeners();
+        this.sendVoiceUpdate();
         this.state = State.DISCONNECTED;
-        if (destroyRemotePlayer) await this.destroy();
-        this.player.node.emit('debug', `[Voice] -> [Node] & [Discord] : Connection Destroyed | Guild: ${this.guildId} | Destroy remote player: ${destroyRemotePlayer}`);
+        this.debug(`[Voice] -> [Node] & [Discord] : Connection Destroyed | Guild: ${this.guildId}`);
     }
 
     /**
      * Connect the current bot user to a voice channel
-     *
-     * @param options.guildId Guild ID in which voice channel to connect to is located
-     * @param options.shardId Unused parameter
-     * @param options.channelId Channel ID of voice channel to connect to
-     * @param options.deaf Optional boolean value to specify whether to deafen or undeafen the current bot user
-     * @param options.mute Optional boolean value to specify whether to mute or unmute the current bot user
+     * @internal
      */
-    public async connect(options: VoiceChannelOptions): Promise<void> {
-        let { guildId, channelId, deaf, mute } = options;
-        if (typeof deaf === undefined) deaf = true;
-        if (typeof mute === undefined) mute = false;
+    public async connect(): Promise<void> {
+        if (this.state === State.CONNECTING || this.state === State.CONNECTED) return;
 
         this.state = State.CONNECTING;
-        this.send({ guild_id: guildId, channel_id: channelId, self_deaf: deaf, self_mute: mute });
-        this.player.node.emit('debug', `[Voice] -> [Discord] : Requesting Connection | Guild: ${this.guildId}`);
+        this.sendVoiceUpdate();
+        this.debug(`[Voice] -> [Discord] : Requesting Connection | Guild: ${this.guildId}`);
 
         const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 15000);
+        const timeout = setTimeout(() => controller.abort(), this.manager.options.voiceConnectionTimeout * 1000);
 
         try {
-            const [ status, error ] = await once(this, 'connectionUpdate', { signal: controller.signal });
+            const [ status ] = await once(this, 'connectionUpdate', { signal: controller.signal });
             if (status !== VoiceState.SESSION_READY) {
                 switch(status) {
                     case VoiceState.SESSION_ID_MISSING: throw new Error('The voice connection is not established due to missing session id');
                     case VoiceState.SESSION_ENDPOINT_MISSING: throw new Error('The voice connection is not established due to missing connection endpoint');
-                    case VoiceState.SESSION_FAILED_UPDATE: throw error;
                 }
             }
             this.state = State.CONNECTED;
         } catch (error: any) {
-            this.player.node.emit('debug', `[Voice] </- [Discord] : Request Connection Failed | Guild: ${this.guildId}`);
+            this.debug(`[Voice] </- [Discord] : Request Connection Failed | Guild: ${this.guildId}`);
             if (error.name === 'AbortError')
-                throw new Error('The voice connection is not established in 15 seconds');
+                throw new Error(`The voice connection is not established in ${this.manager.options.voiceConnectionTimeout} seconds`);
             throw error;
         } finally {
             clearTimeout(timeout);
@@ -190,43 +168,35 @@ export class Connection extends EventEmitter {
     }
 
     /**
-     * Destroy the current Lavalink player
-     */
-    public async destroy(): Promise<void> {
-        await this.player.node.rest.destroyPlayer(this.guildId);
-        this.player.node.emit('debug', `[Lavalink] <- [Shoukaku] : Destroy player sent | Server: ${this.region} Guild: ${this.guildId}`);
-    }
-
-    /**
-     * Update Session ID, Channel ID, Deafen status and Mute status of this instance
+     * Updates SessionId, ChannelId, Deafen and Mute data of this instance
      *
-     * @param options.session_id ID of this session
-     * @param options.channel_id ID of currently connected voice channel
+     * @param options.session_id Id of the current session
+     * @param options.channel_id Id of the connected voice channel
      * @param options.self_deaf Boolean that indicates if the current bot user is deafened or not
      * @param options.self_mute Boolean that indicates if the current bot user is muted or not
      * @internal
      */
-    public setStateUpdate(options: StateUpdatePartial): void {
-        const { session_id, channel_id, self_deaf, self_mute } = options;
-        if (this.channelId && (channel_id && this.channelId !== channel_id)) {
-            this.moved = true;
-            this.player.node.emit('debug', `[Voice] <- [Discord] : Channel Moved | Old Channel: ${this.channelId} Guild: ${this.guildId}`);
+    public setStateUpdate({ session_id, channel_id, self_deaf, self_mute }: StateUpdatePartial): void {
+        this.lastChannelId = this.channelId?.repeat(1) || null;
+        this.channelId = channel_id || null;
+
+        if (this.channelId && this.lastChannelId !== this.channelId) {
+            this.debug(`[Voice] <- [Discord] : Channel Moved | Old Channel: ${this.channelId} Guild: ${this.guildId}`);
         }
 
-        this.channelId = channel_id || this.channelId;
-        if (!channel_id) {
+        if (!this.channelId) {
             this.state = State.DISCONNECTED;
-            this.player.node.emit('debug', `[Voice] <- [Discord] : Channel Disconnected | Guild: ${this.guildId}`);
+            this.debug(`[Voice] <- [Discord] : Channel Disconnected | Guild: ${this.guildId}`);
         }
 
         this.deafened = self_deaf;
         this.muted = self_mute;
         this.sessionId = session_id || null;
-        this.player.node.emit('debug', `[Voice] <- [Discord] : State Update Received | Channel: ${this.channelId} Session ID: ${session_id} Guild: ${this.guildId}`);
+        this.debug(`[Voice] <- [Discord] : State Update Received | Channel: ${this.channelId} Session ID: ${session_id} Guild: ${this.guildId}`);
     }
 
     /**
-     * Send voiceUpdate event to Lavalink and also cache the serverUpdate event from Discord
+     * Sets the server update data for this connection
      * @internal
      */
     public setServerUpdate(data: ServerUpdate): void {
@@ -234,43 +204,45 @@ export class Connection extends EventEmitter {
             this.emit('connectionUpdate', VoiceState.SESSION_ENDPOINT_MISSING);
             return;
         }
-
         if (!this.sessionId) {
             this.emit('connectionUpdate', VoiceState.SESSION_ID_MISSING);
             return;
         }
 
-        if (this.region && !data.endpoint.startsWith(this.region)) {
-            this.moved = true;
-            this.player.node.emit('debug', `[Voice] <- [Discord] : Voice Region Moved | Old Region: ${this.region} Guild: ${this.guildId}`);
+        this.lastRegion = this.region?.repeat(1) || null;
+        this.region = data.endpoint.split('.').shift()?.replace(/[0-9]/g, '') || null;
+
+        if (this.region && this.lastRegion !== this.region) {
+            this.debug(`[Voice] <- [Discord] : Voice Region Moved | Old Region: ${this.lastRegion} New Region: ${this.region} Guild: ${this.guildId}`);
         }
 
-        this.region = data.endpoint.split('.').shift()?.replace(/[0-9]/g, '') || null;
         this.serverUpdate = data;
-        this.player.node.emit('debug', `[Voice] <- [Discord] : Server Update Received | Server: ${this.region} Guild: ${this.guildId}`);
+        this.emit('connectionUpdate', VoiceState.SESSION_READY);
+        this.debug(`[Voice] <- [Discord] : Server Update Received | Server: ${this.region} Guild: ${this.guildId}`);
+    }
 
-        const playerUpdate = {
-            guildId: this.guildId,
-            playerOptions: {
-                voice: {
-                    token: this.serverUpdate!.token,
-                    endpoint: this.serverUpdate!.endpoint,
-                    sessionId: this.sessionId!
-                }
-            }
-        };
-        this.player.node.rest.updatePlayer(playerUpdate)
-            .then(() => this.emit('connectionUpdate', VoiceState.SESSION_READY))
-            .catch(error => this.listenerCount('connectionUpdate') > 0 ? this.emit('connectionUpdate', VoiceState.SESSION_FAILED_UPDATE, error) : this.player.node.error(error));
+    /**
+     * Send voice data to discord
+     * @internal
+     */
+    private sendVoiceUpdate() {
+        this.send({ guild_id: this.guildId, channel_id: this.channelId, self_deaf: this.deafened, self_mute: this.muted });
     }
 
     /**
      * Send data to Discord
      * @param data The data to send
-     * @param important Whether to prioritize sending this packet in the queue
      * @internal
      */
     private send(data: any): void {
-        this.player.node.manager.connector.sendPacket(this.shardId, { op: 4, d: data }, false);
+        this.manager.connector.sendPacket(this.shardId, { op: 4, d: data }, false);
+    }
+
+    /**
+     * Emits a debug log
+     * @internal
+     */
+    private debug(message: string): void {
+        this.manager.emit('debug', this.constructor.name, message);
     }
 }
