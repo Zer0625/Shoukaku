@@ -1,5 +1,5 @@
 import { EventEmitter } from 'events';
-
+// eslint-disable @typescript-eslint/prefer-nullish-coalescing
 // https://stackoverflow.com/a/67244127
 export abstract class TypedEventEmitter<T extends Record<string, unknown[]>> extends EventEmitter {
 	protected constructor() {
